@@ -49,7 +49,13 @@ class Uploader(private val context: Context) {
     }
 
     private val activeUploads = ConcurrentHashMap<String, UploadState>()
-    private val executorService: ExecutorService = Executors.newCachedThreadPool()
+    private val executorService: ExecutorService = Executors.newFixedThreadPool(1)
+    // private val executorService: ExecutorService = Executors.newCachedThreadPool()
+
+
+    init {
+        RNBackgroundDownloaderModuleImpl.logD(TAG, "[PATCH] Uploader initialized with FIXED thread pool FROM FORK, max concurrent uploads = 1")
+    }
 
     /**
      * Start a new upload.
@@ -86,6 +92,12 @@ class Uploader(private val context: Context) {
             executeUpload(state, listener)
         }
         state.thread = thread
+
+        val pool = executorService as? java.util.concurrent.ThreadPoolExecutor
+        val active = pool?.activeCount ?: -1
+        val queued = pool?.queue?.size ?: -1
+        RNBackgroundDownloaderModuleImpl.logD(TAG, "[PATCH] Submitting upload ${config.id} (active=$active, queued=$queued)")
+
         executorService.submit(thread)
     }
 
