@@ -14,6 +14,7 @@ data class RNBGDUploadTaskConfig(
     val fieldName: String? = null,
     val mimeType: String? = null,
     val parameters: Map<String, String>? = null,
+    val isAllowedOverMetered: Boolean = true,
     var reportedBegin: Boolean = false,
     var bytesUploaded: Long = 0,
     var bytesTotal: Long = 0,

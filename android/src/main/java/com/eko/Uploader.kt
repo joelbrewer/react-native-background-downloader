@@ -25,8 +25,8 @@ class Uploader(private val context: Context) {
     companion object {
         private const val TAG = "Uploader"
         private const val BUFFER_SIZE = 8192
-        private const val CONNECT_TIMEOUT_MS = 30000
-        private const val READ_TIMEOUT_MS = 30000
+        private const val CONNECT_TIMEOUT_MS = 60000
+        private const val READ_TIMEOUT_MS = 60000
     }
 
     data class UploadState(

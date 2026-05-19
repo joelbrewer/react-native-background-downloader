@@ -10,9 +10,15 @@ import android.net.Uri
 import android.os.Build
 import android.util.Log
 import android.webkit.MimeTypeMap
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import com.eko.handlers.OnBegin
 import com.eko.handlers.OnProgress
 import com.eko.handlers.OnProgressState
+import com.eko.upload.UploadConstants
+import com.eko.upload.UploadEventBus
+import com.eko.upload.UploadNotificationManager
+import com.eko.upload.UploadScheduler
 import com.eko.utils.HeaderUtils
 import com.eko.utils.StorageManager
 import com.facebook.react.bridge.Arguments
@@ -130,8 +136,9 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     DownloadEventEmitter { getEventEmitter()!! }
   }
 
-  // Uploader for handling file uploads
-  private val uploader: Uploader by lazy { Uploader(reactContext) }
+  // Scheduler for WorkManager-backed file uploads.
+  // Replaces the legacy Uploader; same call sites, different backing engine.
+  private val scheduler = UploadScheduler(reactContext)
 
   // Centralized event emitter for upload events
   private val uploadEventEmitter by lazy {
@@ -306,6 +313,10 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
       UIDTDownloadJobService.setNotificationGroupingConfig(enabled, showNotificationsEnabled, mode, textsMap)
     }
 
+    // Mirror the flag into the upload notification manager so the upload worker
+    // picks the visible vs silent channel correctly.
+    UploadNotificationManager.showNotificationsEnabled = showNotificationsEnabled
+
     logD(NAME, "setNotificationGroupingConfig: enabled=$enabled, showNotificationsEnabled=$showNotificationsEnabled, mode=$mode, texts=$textsMap")
   }
 
@@ -320,17 +331,21 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     // Note: We don't clean up paused notifications here because they should remain visible
     // showing that downloads are paused. They will be cancelled when download is resumed or stopped.
 
-    // Load persisted upload configs (for app restart recovery)
+    // Upload pipeline: subscribe to worker events and prepare notification channels.
+    UploadEventBus.setListener(uploadListener)
+    UploadNotificationManager.createChannels(reactContext)
+
+    // Load persisted upload configs preserving their state — reconcileUploads()
+    // decides whether to auto-resume RUNNING entries or leave SUSPENDED alone.
     synchronized(sharedLock) {
       val persistedUploads = storageManager.loadUploadConfigs()
       for ((id, config) in persistedUploads) {
-        // Mark as suspended since they need to be restarted after app restart
-        config.state = DownloadConstants.TASK_SUSPENDED
         uploadConfigs[id] = config
       }
       if (persistedUploads.isNotEmpty()) {
         logD(NAME, "Loaded ${persistedUploads.size} persisted upload configs")
       }
+      reconcileUploads()
     }
 
     for ((downloadId, config) in downloadIdToConfig) {
@@ -357,6 +372,7 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
 
     unregisterDownloadReceiver()
     downloader.unbindService()
+    UploadEventBus.setListener(null)
   }
 
   private fun registerDownloadReceiver() {
@@ -1224,7 +1240,7 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
   // ============= Upload methods =============
 
   // Listener for upload events
-  private val uploadListener = object : Uploader.UploadListener {
+  private val uploadListener = object : UploadEventBus.Listener {
     override fun onBegin(id: String, expectedBytes: Long) {
       synchronized(sharedLock) {
         uploadConfigs[id]?.let { config ->
@@ -1332,6 +1348,11 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
       return
     }
 
+    val isAllowedOverMetered = if (options.hasKey("isAllowedOverMetered"))
+      options.getBoolean("isAllowedOverMetered")
+    else
+      storageManager.getBooleanSync("allowsCellularAccess", true)
+
     val config = RNBGDUploadTaskConfig(
       id = id,
       url = url,
@@ -1341,7 +1362,8 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
       headers = headers,
       fieldName = fieldName,
       mimeType = mimeType,
-      parameters = parameters
+      parameters = parameters,
+      isAllowedOverMetered = isAllowedOverMetered
     )
 
     synchronized(sharedLock) {
@@ -1351,7 +1373,7 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
       storageManager.saveUploadConfigs(uploadConfigs)
     }
 
-    uploader.startUpload(config, uploadListener)
+    scheduler.enqueue(config)
   }
 
   fun pauseUploadTask(configId: String) {
@@ -1360,17 +1382,22 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
       // Persist state change
       storageManager.saveUploadConfigs(uploadConfigs)
     }
-    uploader.pause(configId)
+    scheduler.pause(configId)
     logD(NAME, "Paused upload: $configId")
   }
 
   fun resumeUploadTask(configId: String) {
-    synchronized(sharedLock) {
-      uploadConfigs[configId]?.state = DownloadConstants.TASK_RUNNING
-      // Persist state change
-      storageManager.saveUploadConfigs(uploadConfigs)
+    val config = synchronized(sharedLock) {
+      uploadConfigs[configId]?.also {
+        it.state = DownloadConstants.TASK_RUNNING
+        storageManager.saveUploadConfigs(uploadConfigs)
+      }
     }
-    uploader.resume(configId, uploadListener)
+    if (config == null) {
+      logW(NAME, "Resume requested for unknown upload: $configId")
+      return
+    }
+    scheduler.resume(config)
     logD(NAME, "Resumed upload: $configId")
   }
 
@@ -1381,7 +1408,7 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
       // Remove from persistent storage
       storageManager.saveUploadConfigs(uploadConfigs)
     }
-    uploader.cancel(configId)
+    scheduler.cancel(configId)
     logD(NAME, "Stopped upload: $configId")
   }
 
@@ -1390,28 +1417,62 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
 
     synchronized(sharedLock) {
       for ((id, config) in uploadConfigs) {
-        val uploadState = uploader.getState(id)
         val params = Arguments.createMap()
         params.putString("id", config.id)
         params.putString("metadata", config.metadata)
-
-        val state = when {
-          uploadState?.isPaused?.get() == true -> DownloadConstants.TASK_SUSPENDED
-          uploadState?.isCancelled?.get() == true -> DownloadConstants.TASK_CANCELING
-          uploadState != null -> DownloadConstants.TASK_RUNNING
-          else -> config.state
-        }
-        params.putInt("state", state)
-
-        val bytesUploaded = uploadState?.bytesUploaded?.get() ?: config.bytesUploaded
-        val bytesTotal = uploadState?.bytesTotal ?: config.bytesTotal
-        params.putDouble("bytesUploaded", bytesUploaded.toDouble())
-        params.putDouble("bytesTotal", bytesTotal.toDouble())
-
+        params.putInt("state", scheduler.getStateConstant(id, config.state))
+        params.putDouble("bytesUploaded", config.bytesUploaded.toDouble())
+        params.putDouble("bytesTotal", config.bytesTotal.toDouble())
         foundTasks.pushMap(params)
       }
     }
 
     promise.resolve(foundTasks)
+  }
+
+  /**
+   * Reconcile persisted upload configs with WorkManager's view of the world.
+   * Called from initialize() under `sharedLock`.
+   *
+   *  - WorkInfo active (queued/running)  → leave alone, WorkManager already restored it
+   *  - WorkInfo terminal (SUCCEEDED/FAILED) → missed the event while dead; drop the entry
+   *  - No WorkInfo and persisted state RUNNING → never enqueued (DB wipe etc.); re-enqueue
+   *  - No WorkInfo and persisted state SUSPENDED → keep as-is, wait for explicit resume()
+   */
+  private fun reconcileUploads() {
+    val wm = WorkManager.getInstance(reactContext)
+    val toRemove = mutableListOf<String>()
+    val toResume = mutableListOf<RNBGDUploadTaskConfig>()
+
+    for ((id, config) in uploadConfigs) {
+      val infos = try {
+        wm.getWorkInfosByTag(UploadConstants.tagFor(id)).get()
+      } catch (e: Exception) {
+        logW(NAME, "reconcileUploads: query failed for $id: ${e.message}")
+        continue
+      }
+      val anyActive = infos.any { !it.state.isFinished }
+      val anyTerminal = infos.any {
+        it.state == WorkInfo.State.SUCCEEDED || it.state == WorkInfo.State.FAILED
+      }
+      when {
+        anyActive -> {} // already restored by WorkManager
+        anyTerminal -> toRemove.add(id)
+        config.state == DownloadConstants.TASK_RUNNING -> toResume.add(config)
+        // else: paused entry with no WorkManager record — keep persisted as-is
+      }
+    }
+
+    for (id in toRemove) uploadConfigs.remove(id)
+    if (toRemove.isNotEmpty()) storageManager.saveUploadConfigs(uploadConfigs)
+
+    for (config in toResume) {
+      uploadProgressReporter.initializeDownload(config.id)
+      scheduler.enqueue(config)
+    }
+
+    if (toRemove.isNotEmpty() || toResume.isNotEmpty()) {
+      logD(NAME, "reconcileUploads: dropped=${toRemove.size}, auto-resumed=${toResume.size}")
+    }
   }
 }
