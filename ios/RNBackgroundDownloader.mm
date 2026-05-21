@@ -283,15 +283,10 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
     @synchronized (sharedLock) {
         if (urlSession == nil) {
             [self sendDebugLog:@"lazyRegisterSession: creating new session" taskId:nil];
-            NSLog(@"[RNBD-SessionDiag] creating NSURLSession with identifier=%@", sessionConfig.identifier);
-            @try {
-                urlSession = [NSURLSession sessionWithConfiguration:sessionConfig delegate:self delegateQueue:nil];
-                NSLog(@"[RNBD-SessionDiag] session created OK: %@", urlSession);
-            } @catch (NSException *exception) {
-                NSLog(@"[RNBD-SessionDiag] *** EXCEPTION creating session name=%@ reason=%@ userInfo=%@\nstack:\n%@",
-                    exception.name, exception.reason, exception.userInfo, exception.callStackSymbols);
-                @throw;
-            }
+            urlSession = [NSURLSession sessionWithConfiguration:sessionConfig delegate:self delegateQueue:nil];
+            // Activate the session by calling getTasksWithCompletionHandler
+            // This forces iOS to fully initialize the background session
+            // On fresh installs, the session may not be ready to process tasks immediately
             [self activateSession];
         } else {
             [self sendDebugLog:@"lazyRegisterSession: session already exists" taskId:nil];
@@ -1528,170 +1523,109 @@ RCT_EXPORT_METHOD(upload:(NSDictionary *)options) {
     }
 
     @synchronized (sharedLock) {
-        NSString *uploadCheckpoint = @"entered @synchronized";
-        @try {
-            NSLog(@"[RNBD-UploadDiag] upload begin id=%@ url=%@ source=%@ method=%@ metadataLen=%lu headersClass=%@ fieldName=%@ mimeType=%@ parametersClass=%@ parametersCount=%lu",
-                identifier, url, source, method,
-                (unsigned long)metadata.length,
-                NSStringFromClass([headers class]),
-                fieldName, mimeType,
-                NSStringFromClass([parameters class]),
-                (unsigned long)(parameters ? parameters.count : 0));
+        [self sendDebugLog:@"upload: calling lazyRegisterSession" taskId:identifier];
+        [self lazyRegisterSession];
 
-            uploadCheckpoint = @"before lazyRegisterSession";
-            [self sendDebugLog:@"upload: calling lazyRegisterSession" taskId:identifier];
-            [self lazyRegisterSession];
-            NSLog(@"[RNBD-UploadDiag] lazyRegisterSession returned urlSession=%@", urlSession);
-
-            uploadCheckpoint = @"before file attributes";
-            NSURL *fileURL = [NSURL fileURLWithPath:source];
-            NSError *fileError;
-            NSDictionary *fileAttrs = [[NSFileManager defaultManager] attributesOfItemAtPath:source error:&fileError];
-            if (fileError) {
-                DLog(identifier, @"[RNBackgroundDownloader] - [Error] Could not read file: %@", fileError.localizedDescription);
-                NSLog(@"[RNBD-UploadDiag] file attr error: %@", fileError);
-                return;
-            }
-            unsigned long long fileSize = [fileAttrs fileSize];
-            NSLog(@"[RNBD-UploadDiag] file ok size=%llu path=%@", fileSize, source);
-
-            uploadCheckpoint = @"before request build";
-            NSURL *parsedURL = [NSURL URLWithString:url];
-            NSLog(@"[RNBD-UploadDiag] parsedURL=%@ (nil means malformed) urlString=%@", parsedURL, url);
-            NSMutableURLRequest *request = [[NSMutableURLRequest alloc] initWithURL:parsedURL];
-            request.HTTPMethod = method;
-            [request setValue:identifier forHTTPHeaderField:@"uploadConfigId"];
-
-            uploadCheckpoint = @"before headers loop";
-            if (headers != nil) {
-                for (id headerKey in headers) {
-                    NSLog(@"[RNBD-UploadDiag] header key class=%@ value=%@ valueClass=%@",
-                        NSStringFromClass([headerKey class]),
-                        [headers valueForKey:headerKey],
-                        NSStringFromClass([[headers valueForKey:headerKey] class]));
-                    [request setValue:[headers valueForKey:headerKey] forHTTPHeaderField:headerKey];
-                }
-            }
-
-            BOOL useMultipart = (parameters != nil && parameters.count > 0) || fieldName != nil;
-            NSLog(@"[RNBD-UploadDiag] useMultipart=%d", useMultipart);
-
-            uploadCheckpoint = @"before taskConfig alloc";
-            NSLog(@"[RNBD-UploadDiag] taskConfig dict: id=%@(%@) url=%@(%@) source=%@(%@) method=%@(%@) metadata=%@(%@) fieldName=%@(%@) mimeType=%@(%@) parameters=%@(%@)",
-                identifier, NSStringFromClass([identifier class]),
-                url, NSStringFromClass([url class]),
-                source, NSStringFromClass([source class]),
-                method, NSStringFromClass([method class]),
-                metadata, NSStringFromClass([metadata class]),
-                fieldName, NSStringFromClass([fieldName class]),
-                mimeType, NSStringFromClass([mimeType class]),
-                parameters, NSStringFromClass([parameters class]));
-            RNBGDUploadTaskConfig *taskConfig = [[RNBGDUploadTaskConfig alloc] initWithDictionary:@{
-                @"id": identifier,
-                @"url": url,
-                @"source": source,
-                @"method": method,
-                @"metadata": metadata,
-                @"fieldName": fieldName ?: [NSNull null],
-                @"mimeType": mimeType ?: [NSNull null],
-                @"parameters": parameters ?: [NSNull null]
-            }];
-            taskConfig.bytesTotal = fileSize;
-            NSLog(@"[RNBD-UploadDiag] taskConfig built");
-
-            NSURLSessionUploadTask *uploadTask;
-
-            if (useMultipart) {
-                uploadCheckpoint = @"multipart: building body";
-                NSString *boundary = [[NSUUID UUID] UUIDString];
-                [request setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
-
-                NSMutableData *body = [NSMutableData data];
-
-                if (parameters != nil) {
-                    for (id key in parameters) {
-                        id val = parameters[key];
-                        NSLog(@"[RNBD-UploadDiag] param key=%@(%@) value=%@(%@)",
-                            key, NSStringFromClass([key class]),
-                            val, NSStringFromClass([val class]));
-                        [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-                        [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"\r\n\r\n", key] dataUsingEncoding:NSUTF8StringEncoding]];
-                        [body appendData:[[NSString stringWithFormat:@"%@\r\n", val] dataUsingEncoding:NSUTF8StringEncoding]];
-                    }
-                }
-
-                NSString *filename = [source lastPathComponent];
-                NSString *contentType = mimeType ?: @"application/octet-stream";
-
-                [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-                [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"; filename=\"%@\"\r\n", fieldName, filename] dataUsingEncoding:NSUTF8StringEncoding]];
-                [body appendData:[[NSString stringWithFormat:@"Content-Type: %@\r\n\r\n", contentType] dataUsingEncoding:NSUTF8StringEncoding]];
-
-                uploadCheckpoint = @"multipart: dataWithContentsOfFile";
-                NSLog(@"[RNBD-UploadDiag] about to dataWithContentsOfFile size=%llu", fileSize);
-                NSData *fileData = [NSData dataWithContentsOfFile:source];
-                NSLog(@"[RNBD-UploadDiag] dataWithContentsOfFile returned %@ length=%lu",
-                    fileData ? @"non-nil" : @"NIL",
-                    (unsigned long)(fileData ? fileData.length : 0));
-                if (fileData == nil) {
-                    NSLog(@"[RNBD-UploadDiag] ABORT: dataWithContentsOfFile returned nil for %@", source);
-                    return;
-                }
-                [body appendData:fileData];
-                [body appendData:[@"\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
-
-                [body appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-
-                uploadCheckpoint = @"multipart: writeToFile";
-                NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
-                BOOL wrote = [body writeToFile:tempPath atomically:YES];
-                NSLog(@"[RNBD-UploadDiag] writeToFile wrote=%d tempPath=%@ bodyLen=%lu", wrote, tempPath, (unsigned long)body.length);
-                NSURL *tempFileURL = [NSURL fileURLWithPath:tempPath];
-
-                taskConfig.bytesTotal = body.length;
-                uploadCheckpoint = @"multipart: uploadTaskWithRequest:fromFile:";
-                uploadTask = [urlSession uploadTaskWithRequest:request fromFile:tempFileURL];
-                NSLog(@"[RNBD-UploadDiag] multipart uploadTask=%@ identifier=%lu", uploadTask, (unsigned long)uploadTask.taskIdentifier);
-            } else {
-                if (mimeType) {
-                    [request setValue:mimeType forHTTPHeaderField:@"Content-Type"];
-                }
-                uploadCheckpoint = @"raw: uploadTaskWithRequest:fromFile:";
-                uploadTask = [urlSession uploadTaskWithRequest:request fromFile:fileURL];
-                NSLog(@"[RNBD-UploadDiag] raw uploadTask=%@ identifier=%lu", uploadTask, (unsigned long)uploadTask.taskIdentifier);
-            }
-
-            if (uploadTask == nil) {
-                DLog(identifier, @"[RNBackgroundDownloader] - [Error] failed to create upload task");
-                NSLog(@"[RNBD-UploadDiag] ABORT: uploadTask is nil");
-                return;
-            }
-
-            uploadCheckpoint = @"before map writes";
-            uploadTaskToConfigMap[@(uploadTask.taskIdentifier)] = taskConfig;
-            uploadCheckpoint = @"before serializeUploadConfig";
-            NSData *serialized = [self serializeUploadConfig:uploadTaskToConfigMap];
-            NSLog(@"[RNBD-UploadDiag] serializeUploadConfig returned %@ bytes", serialized ? @(serialized.length) : @"NIL");
-            [mmkv setData:serialized forKey:ID_TO_UPLOAD_CONFIG_MAP_KEY];
-
-            idToUploadTaskMap[identifier] = uploadTask;
-            idToUploadPercentMap[identifier] = @0.0;
-            idToUploadLastBytesMap[identifier] = @0;
-
-            uploadCheckpoint = @"before [uploadTask resume]";
-            [uploadTask resume];
-            NSLog(@"[RNBD-UploadDiag] uploadTask resumed state=%ld", (long)uploadTask.state);
-            lastUploadProgressReportedAt = [[NSDate alloc] init];
-            NSLog(@"[RNBD-UploadDiag] upload end (success) id=%@", identifier);
-        } @catch (NSException *exception) {
-            NSLog(@"[RNBD-UploadDiag] *** EXCEPTION at checkpoint '%@' name=%@ reason=%@ userInfo=%@\nstack:\n%@",
-                uploadCheckpoint,
-                exception.name,
-                exception.reason,
-                exception.userInfo,
-                exception.callStackSymbols);
-            @throw;
+        // Get file info
+        NSURL *fileURL = [NSURL fileURLWithPath:source];
+        NSError *fileError;
+        NSDictionary *fileAttrs = [[NSFileManager defaultManager] attributesOfItemAtPath:source error:&fileError];
+        if (fileError) {
+            DLog(identifier, @"[RNBackgroundDownloader] - [Error] Could not read file: %@", fileError.localizedDescription);
+            return;
         }
+        unsigned long long fileSize = [fileAttrs fileSize];
+
+        // Create request
+        NSMutableURLRequest *request = [[NSMutableURLRequest alloc] initWithURL:[NSURL URLWithString:url]];
+        request.HTTPMethod = method;
+        [request setValue:identifier forHTTPHeaderField:@"uploadConfigId"];
+
+        // Add custom headers
+        if (headers != nil) {
+            for (NSString *headerKey in headers) {
+                [request setValue:[headers valueForKey:headerKey] forHTTPHeaderField:headerKey];
+            }
+        }
+
+        // Determine if we need multipart
+        BOOL useMultipart = (parameters != nil && parameters.count > 0) || fieldName != nil;
+
+        RNBGDUploadTaskConfig *taskConfig = [[RNBGDUploadTaskConfig alloc] initWithDictionary:@{
+            @"id": identifier,
+            @"url": url,
+            @"source": source,
+            @"method": method,
+            @"metadata": metadata,
+            @"fieldName": fieldName ?: [NSNull null],
+            @"mimeType": mimeType ?: [NSNull null],
+            @"parameters": parameters ?: [NSNull null]
+        }];
+        taskConfig.bytesTotal = fileSize;
+
+        NSURLSessionUploadTask *uploadTask;
+
+        if (useMultipart) {
+            // Create multipart form data
+            NSString *boundary = [[NSUUID UUID] UUIDString];
+            [request setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
+
+            // Build multipart body
+            NSMutableData *body = [NSMutableData data];
+
+            // Add parameters
+            if (parameters != nil) {
+                for (NSString *key in parameters) {
+                    [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+                    [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"\r\n\r\n", key] dataUsingEncoding:NSUTF8StringEncoding]];
+                    [body appendData:[[NSString stringWithFormat:@"%@\r\n", parameters[key]] dataUsingEncoding:NSUTF8StringEncoding]];
+                }
+            }
+
+            // Add file
+            NSString *filename = [source lastPathComponent];
+            NSString *contentType = mimeType ?: @"application/octet-stream";
+
+            [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+            [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"; filename=\"%@\"\r\n", fieldName, filename] dataUsingEncoding:NSUTF8StringEncoding]];
+            [body appendData:[[NSString stringWithFormat:@"Content-Type: %@\r\n\r\n", contentType] dataUsingEncoding:NSUTF8StringEncoding]];
+
+            NSData *fileData = [NSData dataWithContentsOfFile:source];
+            [body appendData:fileData];
+            [body appendData:[@"\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
+
+            // End boundary
+            [body appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+
+            // Write body to temp file for background upload
+            NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
+            [body writeToFile:tempPath atomically:YES];
+            NSURL *tempFileURL = [NSURL fileURLWithPath:tempPath];
+
+            taskConfig.bytesTotal = body.length;
+            uploadTask = [urlSession uploadTaskWithRequest:request fromFile:tempFileURL];
+        } else {
+            // Simple file upload
+            if (mimeType) {
+                [request setValue:mimeType forHTTPHeaderField:@"Content-Type"];
+            }
+            uploadTask = [urlSession uploadTaskWithRequest:request fromFile:fileURL];
+        }
+
+        if (uploadTask == nil) {
+            DLog(identifier, @"[RNBackgroundDownloader] - [Error] failed to create upload task");
+            return;
+        }
+
+        uploadTaskToConfigMap[@(uploadTask.taskIdentifier)] = taskConfig;
+        [mmkv setData:[self serializeUploadConfig:uploadTaskToConfigMap] forKey:ID_TO_UPLOAD_CONFIG_MAP_KEY];
+
+        idToUploadTaskMap[identifier] = uploadTask;
+        idToUploadPercentMap[identifier] = @0.0;
+        idToUploadLastBytesMap[identifier] = @0;
+
+        [uploadTask resume];
+        lastUploadProgressReportedAt = [[NSDate alloc] init];
     }
 }
 
