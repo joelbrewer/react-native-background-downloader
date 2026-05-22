@@ -15,7 +15,7 @@
 #define PROGRESS_MIN_BYTES_KEY @"progressMinBytes"
 
 // Session configuration constants
-static const NSInteger kMaxConnectionsPerHost = 4;
+static const NSInteger kMaxConnectionsPerHost = 1;
 static const NSTimeInterval kRequestTimeoutSeconds = 60 * 60;        // 1 hour - max time to get new data
 static const NSTimeInterval kResourceTimeoutSeconds = 60 * 60 * 24;  // 1 day - max time to download resource
 
