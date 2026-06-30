@@ -80,6 +80,8 @@ static CompletionHandler storedCompletionHandler;
     NSMutableDictionary<NSString *, NSDictionary *> *uploadProgressReports;
     NSMutableDictionary<NSString *, NSNumber *> *idToUploadLastBytesMap;
     NSMutableSet<NSString *> *idsToUploadPauseSet;
+    // [RNBD-PROBE] multipart body temp-file path per upload id, to inspect the file at completion
+    NSMutableDictionary<NSString *, NSString *> *idToUploadBodyTempPathMap;
     NSDate *lastUploadProgressReportedAt;
 }
 
@@ -254,6 +256,7 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
         uploadProgressReports = [[NSMutableDictionary alloc] init];
         idToUploadLastBytesMap = [[NSMutableDictionary alloc] init];
         idsToUploadPauseSet = [[NSMutableSet alloc] init];
+        idToUploadBodyTempPathMap = [[NSMutableDictionary alloc] init];
         lastUploadProgressReportedAt = [[NSDate alloc] init];
 
         [self registerBridgeListener];
@@ -1599,7 +1602,11 @@ RCT_EXPORT_METHOD(upload:(NSDictionary *)options) {
 
             // Write body to temp file for background upload
             NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
-            [body writeToFile:tempPath atomically:YES];
+            BOOL didWriteBody = [body writeToFile:tempPath atomically:YES];
+            // [RNBD-PROBE] confirm the temp body file is fully written at task-creation time
+            unsigned long long bodyOnDiskAtCreate = [[[NSFileManager defaultManager] attributesOfItemAtPath:tempPath error:nil] fileSize];
+            DLog(identifier, @"[RNBD-PROBE] body written: didWrite=%d onDisk=%llu expected=%lu", didWriteBody, bodyOnDiskAtCreate, (unsigned long)body.length);
+            idToUploadBodyTempPathMap[identifier] = tempPath;
             NSURL *tempFileURL = [NSURL fileURLWithPath:tempPath];
 
             taskConfig.bytesTotal = body.length;
@@ -1880,6 +1887,21 @@ RCT_EXPORT_METHOD(getExistingUploadTasks:(RCTPromiseResolveBlock)resolve rejecte
         RNBGDUploadTaskConfig *taskConfig = [self uploadConfigForTask:task];
         if (!taskConfig) {
             return;
+        }
+
+        // [RNBD-PROBE] Inspect the multipart body temp file at completion to see whether it
+        // survived intact through the out-of-process daemon send. Compare bodyOnDisk here with
+        // the at-creation probe, and `sent` with `expected`, to separate a file-lifetime issue
+        // (file gone/short at completion) from a session/connection issue (file full but sent<expected).
+        NSString *bodyTempPath = idToUploadBodyTempPathMap[taskConfig.id];
+        if (bodyTempPath != nil) {
+            NSDictionary *atDoneAttrs = [[NSFileManager defaultManager] attributesOfItemAtPath:bodyTempPath error:nil];
+            BOOL bodyStillExists = (atDoneAttrs != nil);
+            unsigned long long bodyOnDiskAtDone = bodyStillExists ? [atDoneAttrs fileSize] : 0;
+            DLog(taskConfig.id, @"[RNBD-PROBE] at completion: bodyFileExists=%d bodyOnDisk=%llu sent=%lld expected=%lld error=%@",
+                 bodyStillExists, bodyOnDiskAtDone, (long long)task.countOfBytesSent, (long long)task.countOfBytesExpectedToSend,
+                 error ? [error localizedDescription] : @"none");
+            [idToUploadBodyTempPathMap removeObjectForKey:taskConfig.id];
         }
 
         if (error) {
